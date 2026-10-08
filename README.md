@@ -24,7 +24,7 @@ It uses the documented `PATCH https://api.fluxer.app/v1/users/@me/settings` endp
 ## Setup
 
 1. Install [Python 3.9+](https://www.python.org/downloads/) (tick "Add to PATH").
-2. Download this repo (or `git clone`).
+2. Download the latest release
 3. Run `python fluxer_presence.py` once. It creates `config.json` and exits asking for a token.
 4. Put your Fluxer token in `config.json` under `"token"`, or set the `FLUXER_TOKEN` environment variable.
 5. Edit `apps` in `config.json` to match the programs you use.
