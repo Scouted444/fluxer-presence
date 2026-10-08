@@ -14,7 +14,8 @@ It uses the documented `PATCH https://api.fluxer.app/v1/users/@me/settings` endp
 ## Features
 
 - Zero dependencies: Python 3.9+ standard library and `ctypes` only (Windows)
-- Focused app wins; otherwise the highest-priority running app from your list
+- **Picks up the Rich Presence games already have built in** (see below)
+- Otherwise falls back to the focused app, then the highest-priority running app from your list
 - Elapsed timer from the real process start time
 - Optional window title per app (`"title": true`)
 - Restores your original custom status when nothing matches, you go idle, or you quit
@@ -24,7 +25,7 @@ It uses the documented `PATCH https://api.fluxer.app/v1/users/@me/settings` endp
 ## Setup
 
 1. Install [Python 3.9+](https://www.python.org/downloads/) (tick "Add to PATH").
-2. Download the latest [release](https://github.com/Scouted444/fluxer-presence/releases)
+2. Download this repo (or `git clone`).
 3. Run `python fluxer_presence.py` once. It creates `config.json` and exits asking for a token.
 4. Put your Fluxer token in `config.json` under `"token"`, or set the `FLUXER_TOKEN` environment variable.
 5. Edit `apps` in `config.json` to match the programs you use.
@@ -40,6 +41,20 @@ Press `Win+R`, type `shell:startup`, and drop a shortcut to `start_hidden.bat` i
 
 The script edits your own account settings, so it needs your user token: open Fluxer in your browser, open DevTools (F12) → Network, click any request to `api.fluxer.app`, and copy the `Authorization` request header value.
 
+## Game rich presence (built into games)
+
+Most games and many apps already send their Discord Rich Presence to a local pipe, `\\.\pipe\discord-ipc-0` to `-9`. This script opens that pipe and speaks the same protocol (handshake, `SET_ACTIVITY`, ping), so the game thinks it is talking to Discord. A game's `details`, `state`, activity type and start time become your Fluxer status:
+
+```
+🎮 Playing Bully — Chapter 2 · In class · 1h 01m
+```
+
+The game's display name comes from your `apps` list if the exe is there, otherwise from the exe file name. When a game sends nothing, the script falls back to plain app detection.
+
+**Discord has to be closed.** Games connect to the first pipe they can open, and Discord grabs `discord-ipc-0`. If Discord is running, the script logs a warning and games will keep talking to Discord. If you need both, use [fluxer-rpc](https://github.com/letruxux/fluxer-rpc) instead.
+
+Set `"rpc_enabled": false` to turn this off.
+
 ## Config reference
 
 | Key | Default | Meaning |
@@ -50,6 +65,7 @@ The script edits your own account settings, so it needs your user token: open Fl
 | `status_ttl_minutes` | `5` | Status auto-expires this long after the last push |
 | `idle_minutes` | `10` | No input for this long clears the status (`0` = off) |
 | `restore_original_status` | `true` | Put your previous custom status back |
+| `rpc_enabled` | `true` | Listen for games' built-in Discord Rich Presence |
 | `apps` | see `config.example.json` | `exe name → {name, verb, emoji, priority, title?}` |
 
 Exe names are matched case-insensitively. Lower `priority` wins when nothing listed is focused. Emoji must be plain Unicode (custom emoji need an ID and an account entitlement).
@@ -58,7 +74,8 @@ Exe names are matched case-insensitively. Lower `priority` wins when nothing lis
 
 - **Keep `config.json` private.** Anyone with your token controls your account. It is in `.gitignore`; don't remove that.
 - Automating a user account may not be allowed by Fluxer's rules. You use this at your own risk.
-- It only knows the app name, timer, and window title. It can't show in-game details like Discord's Game SDK.
+- Fluxer only has a custom status line, so you get text and one emoji, not Discord-style cards with images, buttons, or party info.
+- Only the most recently updated game is shown if several are running.
 - Windows only.
 
 ## Related

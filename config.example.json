@@ -5,6 +5,7 @@
   "status_ttl_minutes": 5,
   "idle_minutes": 10,
   "restore_original_status": true,
+  "rpc_enabled": true,
   "apps": {
     "bully.exe": {
       "name": "Bully",

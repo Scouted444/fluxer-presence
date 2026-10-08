@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 fluxer_presence.py - Discord-style "rich presence" for Fluxer (Windows).
 
 Fluxer has no native Rich Presence / plugin API yet, so this runs as a small
@@ -10,7 +10,11 @@ Fluxer custom status to something like:
 
 Features
   - Zero dependencies (Python 3.9+ stdlib + ctypes, Windows only)
-  - Foreground app wins; otherwise highest-priority running app from your list
+  - Picks up the Discord Rich Presence that games/apps already have built in: it
+    listens on Discord's local IPC pipe (\\.\pipe\discord-ipc-N), so a game's
+    "Playing X - details - state" shows up on Fluxer with no per-game setup
+    (requires Discord to be closed, otherwise games talk to Discord instead)
+  - Game rich presence wins; otherwise the focused app, then highest-priority running app
   - Elapsed timer based on the real process start time
   - Optional window title (e.g. the file open in VS Code)
   - Clears to your ORIGINAL custom status when nothing matches / you go idle / you exit
@@ -27,13 +31,17 @@ Test without touching your account:  python fluxer_presence.py --dry-run
 Endpoint used: PATCH https://api.fluxer.app/v1/users/@me/settings  {"custom_status": {...}}
 """
 
+import asyncio
 import atexit
 import ctypes
+import itertools
 import json
 import os
 import re
 import signal
+import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,6 +60,7 @@ DEFAULT_CONFIG = {
     "status_ttl_minutes": 5,      # status auto-expires this long after the last push
     "idle_minutes": 10,           # no keyboard/mouse for this long = clear status (0 = off)
     "restore_original_status": True,
+    "rpc_enabled": True,          # listen for games' built-in Discord Rich Presence
     # Lower priority number wins when several listed apps run and none is focused.
     # verb + name + timer are joined as "<verb> <name> · <timer>".
     # "title": true appends the window title of that app's focused window.
@@ -158,15 +167,19 @@ class Win:
         buf = ctypes.create_unicode_buffer(512)
         self.u.GetWindowTextW(hwnd, buf, 512)
         title = buf.value
-        h = self._open(pid.value)
+        return self.exe_of(pid.value), title
+
+    def exe_of(self, pid):
+        """Lower-case exe file name for a pid, or None."""
+        h = self._open(pid)
         if not h:
-            return None, title
+            return None
         try:
             path = ctypes.create_unicode_buffer(1024)
             size = wintypes.DWORD(1024)
             if not self.k.QueryFullProcessImageNameW(h, 0, path, ctypes.byref(size)):
-                return None, title
-            return os.path.basename(path.value).lower(), title
+                return None
+            return os.path.basename(path.value).lower()
         finally:
             self.k.CloseHandle(h)
 
@@ -240,6 +253,144 @@ class Fluxer:
 
 
 # --------------------------------------------------------------------------- #
+# Discord-compatible local RPC server (what games' built-in Rich Presence talks to)
+#
+# Wire format on the pipe: [uint32 LE opcode][uint32 LE length][JSON payload]
+#   opcodes: 0 handshake, 1 frame, 2 close, 3 ping, 4 pong
+# --------------------------------------------------------------------------- #
+OP_HANDSHAKE, OP_FRAME, OP_CLOSE, OP_PING, OP_PONG = range(5)
+MAX_FRAME = 1024 * 1024
+RPC_VERBS = {0: "Playing", 1: "Streaming", 2: "Listening to", 3: "Watching", 5: "Competing in"}
+RPC_EMOJI = {0: "🎮", 1: "📡", 2: "🎧", 3: "📺", 5: "🏆"}
+
+
+def encode_frame(op, payload):
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return struct.pack("<II", op, len(data)) + data
+
+
+class RpcState:
+    """Thread-safe store of the activities currently set by connected games."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.entries = {}  # connection id -> entry dict
+
+    def set(self, cid, entry):
+        with self.lock:
+            entry["updated"] = time.time()
+            self.entries[cid] = entry
+
+    def clear(self, cid):
+        with self.lock:
+            self.entries.pop(cid, None)
+
+    def current(self):
+        with self.lock:
+            if not self.entries:
+                return None
+            return max(self.entries.values(), key=lambda e: e["updated"])
+
+
+class RpcProtocol(asyncio.Protocol):
+    _ids = itertools.count(1)
+
+    def __init__(self, state):
+        self.state = state
+        self.cid = next(self._ids)
+        self.transport = None
+        self.buf = b""
+        self.client_id = None
+        self.connected_at = time.time()
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def connection_lost(self, exc):
+        self.state.clear(self.cid)
+
+    def data_received(self, data):
+        self.buf += data
+        while len(self.buf) >= 8:
+            op, length = struct.unpack("<II", self.buf[:8])
+            if length > MAX_FRAME:
+                return self._close()
+            if len(self.buf) < 8 + length:
+                return
+            body, self.buf = self.buf[8:8 + length], self.buf[8 + length:]
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except (UnicodeDecodeError, ValueError):
+                return self._close()
+            self._handle(op, payload, body)
+
+    def _send(self, op, payload):
+        if self.transport and not self.transport.is_closing():
+            self.transport.write(encode_frame(op, payload))
+
+    def _close(self):
+        if self.transport and not self.transport.is_closing():
+            self.transport.close()
+
+    def _handle(self, op, payload, raw):
+        if op == OP_HANDSHAKE:
+            self.client_id = str(payload.get("client_id", ""))
+            self._send(OP_FRAME, {
+                "cmd": "DISPATCH", "evt": "READY", "nonce": None,
+                "data": {
+                    "v": 1,
+                    "config": {"cdn_host": "cdn.discordapp.com", "api_endpoint": "//discord.com/api",
+                               "environment": "production"},
+                    "user": {"id": "1", "username": "fluxer", "discriminator": "0", "avatar": None},
+                },
+            })
+        elif op == OP_PING:
+            if self.transport and not self.transport.is_closing():
+                self.transport.write(struct.pack("<II", OP_PONG, len(raw)) + raw)
+        elif op == OP_CLOSE:
+            self._close()
+        elif op == OP_FRAME:
+            cmd, nonce = payload.get("cmd"), payload.get("nonce")
+            if cmd == "SET_ACTIVITY":
+                args = payload.get("args") or {}
+                act = args.get("activity")
+                if act:
+                    self.state.set(self.cid, {"activity": act, "pid": args.get("pid"),
+                                              "client_id": self.client_id,
+                                              "connected_at": self.connected_at})
+                else:
+                    self.state.clear(self.cid)
+                self._send(OP_FRAME, {"cmd": cmd, "data": act, "evt": None, "nonce": nonce})
+            else:  # SUBSCRIBE, GET_USER, etc.: ack with an empty result
+                self._send(OP_FRAME, {"cmd": cmd, "data": {}, "evt": None, "nonce": nonce})
+
+
+def start_rpc_server(state):
+    """Open the first free discord-ipc-N pipe. Returns N, or None if all are taken."""
+    result = {}
+    ready = threading.Event()
+
+    def run():
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+        for i in range(10):
+            try:
+                loop.run_until_complete(
+                    loop.start_serving_pipe(lambda: RpcProtocol(state), rf"\\.\pipe\discord-ipc-{i}"))
+                result["index"] = i
+                break
+            except OSError:  # PermissionError if another process (Discord) owns this pipe
+                continue
+        ready.set()
+        if "index" in result:
+            loop.run_forever()
+
+    threading.Thread(target=run, daemon=True, name="rpc-server").start()
+    ready.wait(5)
+    return result.get("index")
+
+
+# --------------------------------------------------------------------------- #
 # Logic
 # --------------------------------------------------------------------------- #
 def log(msg):
@@ -294,16 +445,47 @@ def build_status(exe, app, start, title, cfg):
     t = clean_title(title, name) if title else ""
     if t:
         text = f"{app.get('verb', 'Using')} {name} — {t} · {fmt_elapsed(time.time() - start)}"
+    return finalize(text, app.get("emoji"), cfg)
+
+
+def finalize(text, emoji, cfg):
     if len(text) > MAX_STATUS_LEN:
         text = text[: MAX_STATUS_LEN - 1] + "…"
     status = {"text": text}
-    if app.get("emoji"):
-        status["emoji_name"] = app["emoji"]
+    if emoji:
+        status["emoji_name"] = emoji
     ttl = float(cfg["status_ttl_minutes"])
     if ttl > 0:
         exp = datetime.now(timezone.utc) + timedelta(minutes=ttl)
         status["expires_at"] = exp.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     return status
+
+
+def build_rpc_status(entry, win, cfg):
+    """Turn a game's SET_ACTIVITY payload into a Fluxer custom status."""
+    act = entry["activity"]
+    atype = act.get("type") if isinstance(act.get("type"), int) else 0
+    pid = entry.get("pid")
+    exe = win.exe_of(pid) if isinstance(pid, int) else None
+
+    app = cfg["apps"].get(exe or "", {})
+    name = app.get("name") or (os.path.splitext(exe)[0].replace("_", " ").title() if exe else "a game")
+
+    details, state = act.get("details"), act.get("state")
+    detail = " · ".join(str(x).strip() for x in (details, state) if x and str(x).strip())
+
+    start = (act.get("timestamps") or {}).get("start")
+    if isinstance(start, (int, float)) and start > 0:
+        start = start / 1000 if start > 1e12 else start  # some games send milliseconds
+    else:
+        start = (win.start_time(pid) if isinstance(pid, int) else None) or entry["connected_at"]
+
+    verb = RPC_VERBS.get(atype, "Playing")
+    text = f"{verb} {name}"
+    if detail:
+        text += f" — {detail}"
+    text += f" · {fmt_elapsed(time.time() - start)}"
+    return finalize(text, app.get("emoji") or RPC_EMOJI.get(atype, "🎮"), cfg)
 
 
 def usable_original(status):
@@ -354,6 +536,17 @@ def main():
     handler = HANDLER(lambda ev: (cleanup(), False)[1])
     ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)
 
+    rpc_state = RpcState()
+    if cfg.get("rpc_enabled", True):
+        idx = start_rpc_server(rpc_state)
+        if idx is None:
+            log("could not open any discord-ipc pipe; game rich presence disabled")
+        elif idx == 0:
+            log("listening for games' built-in rich presence on discord-ipc-0")
+        else:
+            log(f"Discord is running (pipe 0 is taken), so games will connect to Discord first. "
+                f"Close Discord for games to reach this script (listening on discord-ipc-{idx}).")
+
     log("running - Ctrl+C to quit" + (" (dry run)" if dry_run else ""))
     last_key, last_push = None, 0.0
     poll = max(0.5, float(cfg["poll_seconds"]))
@@ -364,16 +557,23 @@ def main():
         try:
             idle_limit = float(cfg["idle_minutes"]) * 60
             idle = idle_limit > 0 and win.idle_seconds() >= idle_limit
-            pick = None if idle else pick_app(win, cfg)
+            status = None
+            if not idle:
+                entry = rpc_state.current()
+                if entry:
+                    status = build_rpc_status(entry, win, cfg)
+                else:
+                    pick = pick_app(win, cfg)
+                    if pick:
+                        status = build_status(*pick, cfg)
             now = time.time()
 
-            if pick is None:
+            if status is None:
                 if state["showing"] and now - last_push >= 5 and fx.set_custom_status(original):
                     state.update(showing=False)
                     last_key, last_push = None, now
                     log("no activity - status restored")
             else:
-                status = build_status(*pick, cfg)
                 key = status["text"]
                 due = key != last_key and now - last_push >= min_gap
                 stale = now - last_push >= heartbeat
